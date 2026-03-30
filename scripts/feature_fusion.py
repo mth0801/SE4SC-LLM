@@ -2,172 +2,308 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModel
 from sklearn.decomposition import PCA
 import torch
+import torch.nn as nn
 import scipy.special
 import os
+import pickle
+import time
 
-# Initialize distilroberta-base
+# ---------------------------------------------------------------------------
+# LLM embedding model configuration
+# Supported models in the paper: CodeBERT, DistilCodeBERT, OpenAI text-emb-3-large, DeepSeek-Coder-33B
+# Default: microsoft/codebert-base (CodeBERT, 12-layer, 768-dim)
+# Override via environment variable: SE4SC_LLM_MODEL=distilbert/distilcodebert-base
+# ---------------------------------------------------------------------------
+DEFAULT_LLM_MODEL = "microsoft/codebert-base"
+LLM_MODEL_NAME = os.environ.get("SE4SC_LLM_MODEL", DEFAULT_LLM_MODEL)
+
 try:
-    tokenizer = AutoTokenizer.from_pretrained("distilroberta-base")
-    model = AutoModel.from_pretrained("distilroberta-base", use_safetensors=True)
+    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
+    llm_model = AutoModel.from_pretrained(LLM_MODEL_NAME)
 except Exception as e:
-    print(f"Error loading distilroberta-base: {e}")
-    print("Ensure model is downloaded or check network connection.")
+    print(f"Error loading LLM model '{LLM_MODEL_NAME}': {e}")
+    print("Set SE4SC_LLM_MODEL environment variable to a valid HuggingFace model name.")
+    print("Supported: microsoft/codebert-base, microsoft/codebert-base-mlm, distilbert/distilcodebert-base")
     raise
 
-# Pre-fit PCA on mock SmartBugs snippets
+
 def get_embeddings(text):
+    """Get mean-pooled last hidden state embedding from LLM, with caching."""
+    if text in _embedding_cache:
+        return _embedding_cache[text]
     inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=128)
     with torch.no_grad():
-        outputs = model(**inputs)
-    return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
+        outputs = llm_model(**inputs)
+    result = outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
+    _embedding_cache[text] = result
+    return result
 
-mock_snippets = [
-    {'jumpSeq': 'PUSH1 0x40 JUMPI', 'pc': '0x12'},
-    {'jumpSeq': 'PUSH1 0x10 JUMP', 'pc': '0x1a'},
-    {'jumpSeq': 'PUSH2 0x100 JUMPI', 'pc': '0x20'},
-    {'jumpSeq': 'DUP1 SWAP1 JUMP', 'pc': '0x30'}
-]
-try:
-    embeddings_list = [get_embeddings(f"{s['jumpSeq']} | pc:{s['pc']}") for s in mock_snippets]
-    pca = PCA(n_components=3)
-    pca.fit(embeddings_list)
-except Exception as e:
-    print(f"Error pre-fitting PCA: {e}")
-    raise
 
-# Projection matrices with increased variance for SSI
-np.random.seed(42)
-d_intermediate = 8
-W_q = np.random.normal(0, 2.0, (3, d_intermediate))
-W_k = np.random.normal(0, 2.0, (10, d_intermediate))
-W_v = np.random.normal(0, 2.0, (10, d_intermediate))
-W_q_ssf = np.random.normal(0, 0.5, (d_intermediate, d_intermediate))
-W_k_ssf = np.random.normal(0, 0.5, (3, d_intermediate))
-W_v_ssf = np.random.normal(0, 0.5, (3, d_intermediate))
-W_out = np.random.normal(0, 0.5, (d_intermediate, 13))
+# Embedding cache: identical control flow fragments produce identical CFEF vectors
+_embedding_cache = {}
 
-def symflow_feature_fusion(jumpSeq, pc, sef, coverage_branch=0.5, coverage_path=0.5):
+
+# ---------------------------------------------------------------------------
+# PCA fitting: supports both mock bootstrap and real-data fitting
+# ---------------------------------------------------------------------------
+PCA_MODEL_PATH = os.path.join(os.path.dirname(__file__), "pca_model.pkl")
+PCA_N_COMPONENTS = 3
+
+def _build_snippet_text(jumpSeq, constraint, pc_hex):
+    return f"<jumpSeq>{jumpSeq}</jumpSeq> <constraint>{constraint}</constraint> <pc>{pc_hex}</pc>"
+
+
+def fit_pca_from_real_data(snippets):
     """
-    Generate unified 13D feature vector for SymFlow state prioritization (Sections 3.3-3.4).
-    Follows demo logic with multi-dimensional attention, pre-fitted PCA, and tuned projection matrices/attention scaling.
+    Fit PCA on real control-flow fragments collected during symbolic execution.
+    
+    Args:
+        snippets: list of snippet strings (pre-built via _build_snippet_text).
+    
+    Returns:
+        Fitted PCA object.
+    """
+    embeddings_list = []
+    for text in snippets:
+        emb = get_embeddings(text)
+        embeddings_list.append(emb)
+    
+    pca = PCA(n_components=PCA_N_COMPONENTS)
+    pca.fit(embeddings_list)
+    
+    # Save for reuse
+    with open(PCA_MODEL_PATH, 'wb') as f:
+        pickle.dump(pca, f)
+    print(f"PCA model fitted on {len(snippets)} real snippets and saved to {PCA_MODEL_PATH}")
+    return pca
+
+
+def _load_or_bootstrap_pca():
+    """Load saved PCA model, or bootstrap with representative snippets."""
+    if os.path.exists(PCA_MODEL_PATH):
+        with open(PCA_MODEL_PATH, 'rb') as f:
+            pca = pickle.load(f)
+        print(f"PCA model loaded from {PCA_MODEL_PATH}")
+        return pca
+    
+    # Bootstrap with representative EVM control-flow snippets
+    bootstrap_snippets = [
+        {'jumpSeq': 'PUSH1 0x40 JUMPI', 'constraint': 'msg.sender == owner', 'pc': '0x12'},
+        {'jumpSeq': 'PUSH1 0x10 JUMP', 'constraint': 'balance > 0', 'pc': '0x1a'},
+        {'jumpSeq': 'PUSH2 0x100 JUMPI', 'constraint': 'block.timestamp >= deadline', 'pc': '0x20'},
+        {'jumpSeq': 'DUP1 SWAP1 JUMP', 'constraint': 'amount <= allowance', 'pc': '0x30'},
+        {'jumpSeq': 'PUSH1 0x60 JUMPI', 'constraint': 'value != 0', 'pc': '0x44'},
+        {'jumpSeq': 'PUSH2 0x200 JUMP', 'constraint': '', 'pc': '0x58'},
+        {'jumpSeq': 'PUSH1 0x80 JUMPI', 'constraint': 'approved == True', 'pc': '0x6c'},
+        {'jumpSeq': 'SWAP1 PUSH1 0x50 JUMP', 'constraint': 'tokenId < totalSupply', 'pc': '0x80'},
+    ]
+    embeddings_list = [
+        get_embeddings(_build_snippet_text(s['jumpSeq'], s['constraint'], s['pc']))
+        for s in bootstrap_snippets
+    ]
+    pca = PCA(n_components=PCA_N_COMPONENTS)
+    pca.fit(embeddings_list)
+    print("PCA model bootstrapped with representative snippets (will be replaced by real data during training)")
+    return pca
+
+
+pca = _load_or_bootstrap_pca()
+
+
+# ---------------------------------------------------------------------------
+# Trainable Feature Fusion Module (PyTorch)
+# ---------------------------------------------------------------------------
+
+class FeatureFusionModule(nn.Module):
+    """
+    Coverage-driven interactive fusion module (Section 3.3.2).
+    Fuses 3D CFEF and 10D SEF via SSI and SSF attention units
+    with learnable projection matrices.
+    """
+    def __init__(self, cfef_dim=3, sef_dim=10, d_intermediate=8, output_dim=13):
+        super().__init__()
+        self.d_intermediate = d_intermediate
+        self.output_dim = output_dim
+        
+        # SSI projection matrices (learnable)
+        self.W_q_ssi = nn.Linear(cfef_dim, d_intermediate, bias=False)
+        self.W_k_ssi = nn.Linear(sef_dim, d_intermediate, bias=False)
+        self.W_v_ssi = nn.Linear(sef_dim, d_intermediate, bias=False)
+        
+        # SSF projection matrices (learnable)
+        self.W_q_ssf = nn.Linear(d_intermediate, d_intermediate, bias=False)
+        self.W_k_ssf = nn.Linear(cfef_dim, d_intermediate, bias=False)
+        self.W_v_ssf = nn.Linear(cfef_dim, d_intermediate, bias=False)
+        
+        # Output projection
+        self.W_out = nn.Linear(d_intermediate, output_dim, bias=False)
+    
+    def forward(self, cfef, sef, coverage_branch, coverage_path):
+        """
+        Args:
+            cfef: (..., cfef_dim) tensor - CFEF vector(s)
+            sef: (..., sef_dim) tensor - SEF vector(s)
+            coverage_branch: float or (...,) tensor
+            coverage_path: float or (...,) tensor
+        Returns:
+            unified: (..., output_dim) tensor - fused feature vector(s)
+        """
+        # Handle both single and batched inputs
+        single = cfef.dim() == 1
+        if single:
+            cfef = cfef.unsqueeze(0)
+            sef = sef.unsqueeze(0)
+        batch_size = cfef.size(0)
+        
+        # Preprocessing: coverage weight
+        if isinstance(coverage_branch, (int, float)):
+            w_cov = torch.sigmoid(torch.tensor(coverage_branch + coverage_path, dtype=torch.float32, device=cfef.device))
+            w_cov = w_cov.expand(batch_size)
+        else:
+            w_cov = torch.sigmoid(coverage_branch + coverage_path)  # (batch,)
+        
+        # Preprocess SEF with coverage weighting
+        sef_scaled = sef / (torch.norm(sef, dim=-1, keepdim=True) + 1e-8)  # (batch, sef_dim)
+        cov_weights = torch.ones_like(sef_scaled)
+        cov_weights[:, 3] = w_cov
+        cov_weights[:, 4] = w_cov
+        sef_weighted = sef_scaled * cov_weights
+        
+        # Preprocess CFEF (L2 normalize)
+        cfef_scaled = cfef / (torch.norm(cfef, dim=-1, keepdim=True) + 1e-8)  # (batch, cfef_dim)
+        
+        # SSI Unit: CFEF queries SEF
+        Q_ssi = self.W_q_ssi(cfef_scaled)       # (batch, d)
+        K_ssi = self.W_k_ssi(sef_weighted)       # (batch, d)
+        V_ssi = self.W_v_ssi(sef_weighted)       # (batch, d)
+        
+        # Outer-product attention per sample
+        scores_ssi = (Q_ssi.unsqueeze(2) * K_ssi.unsqueeze(1)) / (self.d_intermediate ** 0.5)  # (batch, d, d)
+        attn_ssi = torch.softmax(scores_ssi, dim=2)  # (batch, d, d)
+        Z1 = (attn_ssi @ V_ssi.unsqueeze(2)).squeeze(2)  # (batch, d)
+        
+        # SSF Unit: Z1 queries CFEF
+        Q_ssf = self.W_q_ssf(Z1)                # (batch, d)
+        K_ssf = self.W_k_ssf(cfef_scaled)        # (batch, d)
+        V_ssf = self.W_v_ssf(cfef_scaled)        # (batch, d)
+        
+        scores_ssf = (Q_ssf.unsqueeze(2) * K_ssf.unsqueeze(1)) / (self.d_intermediate ** 0.5)
+        attn_ssf = torch.softmax(scores_ssf, dim=2)
+        Z2 = (attn_ssf @ V_ssf.unsqueeze(2)).squeeze(2)  # (batch, d)
+        
+        # Fusion coefficient
+        alpha = w_cov.unsqueeze(1)  # (batch, 1)
+        
+        # Fused feature
+        F_f = Z1 + alpha * Z2  # (batch, d)
+        
+        # Project to output dimension
+        F_f_proj = self.W_out(F_f)  # (batch, output_dim)
+        
+        # Residual connection
+        pad_sef = self.output_dim - sef_weighted.size(1)
+        pad_cfef = self.output_dim - cfef_scaled.size(1)
+        F_sef_padded = torch.cat([sef_weighted, torch.zeros(batch_size, pad_sef, device=sef.device)], dim=1)
+        F_cfef_padded = torch.cat([torch.zeros(batch_size, pad_cfef, device=cfef.device), cfef_scaled], dim=1)
+        residual = F_sef_padded + F_cfef_padded
+        residual = residual / (torch.norm(residual, dim=-1, keepdim=True) + 1e-8)
+        
+        unified = F_f_proj + residual
+        unified = unified / (torch.norm(unified, dim=-1, keepdim=True) + 1e-8)
+        
+        if single:
+            unified = unified.squeeze(0)
+        
+        return unified
+
+
+# Global fusion module instance (will be trained alongside regression model)
+fusion_module = FeatureFusionModule()
+
+
+# ---------------------------------------------------------------------------
+# Main fusion function (called during symbolic execution)
+# ---------------------------------------------------------------------------
+
+def symflow_feature_fusion(jumpSeq, pc, sef, constraint="", coverage_branch=0.5, coverage_path=0.5):
+    """
+    Generate unified 13D feature vector for state prioritization (Sections 3.3-3.4).
     
     Args:
         jumpSeq (str): EVM instruction sequence (e.g., 'PUSH1 0x80 PUSH1 0x40 JUMPI').
         pc (int): Program counter (e.g., 0x12).
-        sef (list): List of 10 integers [stackSize, successor, ..., subpath], normalized [0, 1].
+        sef (list): List of 10 floats [stackSize, successor, ..., subpath], normalized [0, 1].
+        constraint (str): Symbolic expression of the current path condition.
         coverage_branch (float): SEF coverage_branch (index 3), normalized [0, 1].
         coverage_path (float): SEF coverage_path (index 4), normalized [0, 1].
     
     Returns:
-        np.ndarray: Unified 13D feature vector, L2-normalized (Eq. 7).
+        np.ndarray: Unified 13D feature vector, L2-normalized.
     """
     # Input validation
     if not isinstance(jumpSeq, str):
         raise ValueError(f"jumpSeq must be a string, got {type(jumpSeq)}")
     if not isinstance(pc, int):
         raise ValueError(f"pc must be an integer, got {type(pc)}")
+    if not isinstance(constraint, str):
+        constraint = str(constraint)
+    
     sef = np.array(sef, dtype=np.float32)
     if len(sef) != 10 or not (sef >= 0).all() or not (sef <= 1).all():
-        raise ValueError("SEF must be a list of 10 integers with values in [0, 1]")
+        raise ValueError("SEF must be a list of 10 floats with values in [0, 1]")
     if not (0 <= coverage_branch <= 1) or not (0 <= coverage_path <= 1):
         raise ValueError("coverage_branch and coverage_path must be in [0, 1]")
 
-    # Step 1: Create snippet dictionary (Section 3.3)
-    snippet = {'jumpSeq': jumpSeq, 'pc': hex(pc)}
-    input_text = f"{snippet['jumpSeq']} | pc:{snippet['pc']}"
-    # print(f"输入文本: {input_text}")
+    # Step 1: Build control flow fragment text (Section 3.3.1)
+    input_text = _build_snippet_text(jumpSeq, constraint, hex(pc))
 
-    # Step 2: Generate embedding (Section 3.3)
+    # Step 2: Generate LLM embedding (Section 3.3.1)
     try:
+        _t_emb = time.time()
+        _was_cached = input_text in _embedding_cache
         embedding = get_embeddings(input_text)
-        # print(f"高维嵌入（前10维）: {embedding[:10].tolist()}...")
+        _emb_elapsed = time.time() - _t_emb
+        # Store for benchmark access
+        symflow_feature_fusion._last_embedding_time = _emb_elapsed
+        symflow_feature_fusion._last_was_cached = _was_cached
     except Exception as e:
         print(f"Error generating embedding: {e}")
         raise
 
-    # Step 3: Reduce to 3D CFEF via PCA (Section 3.3)
+    # Step 3: Reduce to 3D CFEF via PCA (Section 3.3.1)
     try:
         cfef = pca.transform(embedding.reshape(1, -1))[0]
         norm = np.linalg.norm(cfef) + 1e-8
         cfef = cfef / norm
-        # print(f"CFEF向量: {cfef.tolist()}")
     except Exception as e:
         print(f"Error in PCA reduction: {e}")
         raise
 
-    # Step 4: Feature fusion (Section 3.4)
-    # print(f"\nFeature Fusion for SEF: {sef.tolist()[:5]}... CFEF: {cfef.tolist()}")
-    # print(f"Coverage branch: {coverage_branch}, Coverage path: {coverage_path}")
+    # Step 4: Feature fusion via trainable module (Section 3.3.2)
+    cfef_tensor = torch.tensor(cfef, dtype=torch.float32)
+    sef_tensor = torch.tensor(sef, dtype=torch.float32)
+    
+    fusion_module.eval()
+    with torch.no_grad():
+        unified = fusion_module(cfef_tensor, sef_tensor, coverage_branch, coverage_path)
+    
+    return unified.numpy()
 
-    # Preprocessing: L2 normalize SEF and CFEF (Eq. 1-2)
-    sef_scaled = sef / (np.linalg.norm(sef) + 1e-8)
-    cfef_scaled = cfef
-    w_coverage = min(coverage_branch + coverage_path, 2.0)
-    # print(f"w_coverage: {w_coverage}")
-    W_sef = np.diag([w_coverage if i in [3, 4] else 1.0 for i in range(10)])
-    sef_weighted = W_sef @ sef_scaled
-    # print(f"SEF weighted: {sef_weighted.tolist()[:5]}...")
 
-    # SSI Unit (Eq. 3)
-    Q_ssi = cfef_scaled @ W_q  # (8,)
-    K_ssi = sef_weighted @ W_k  # (8,)
-    V_ssi = sef_weighted @ W_v  # (8,)
-    scores_ssi = np.clip((Q_ssi[:, None] @ K_ssi[None, :]) / np.sqrt(d_intermediate) * 4.0, -10, 10)  # (8, 8)
-    attention_ssi = scipy.special.softmax(scores_ssi, axis=1)  # (8, 8)
-    F_ssi = (attention_ssi @ V_ssi[:, None]).squeeze()  # (8,)
-    # print(f"SSI attention (first row): {attention_ssi[0].tolist()[:5]}..., F_ssi: {F_ssi.tolist()[:5]}...")
-
-    # SSF Unit (Eq. 4)
-    Q_ssf = F_ssi @ W_q_ssf  # (8,)
-    K_ssf = cfef_scaled @ W_k_ssf  # (8,)
-    V_ssf = cfef_scaled @ W_v_ssf  # (8,)
-    scores_ssf = np.clip((Q_ssf[:, None] @ K_ssf[None, :]) / np.sqrt(d_intermediate) * 2.0, -10, 10)  # (8, 8)
-    attention_ssf = scipy.special.softmax(scores_ssf, axis=1)  # (8, 8)
-    F_ssf = (attention_ssf @ V_ssf[:, None]).squeeze()  # (8,)
-    # print(f"SSF attention (first row): {attention_ssf[0].tolist()[:5]}..., F_ssf: {F_ssf.tolist()[:5]}...")
-
-    # Project to 13D
-    F_ssf_projected = F_ssf @ W_out  # (13,)
-    F_ssi_projected = F_ssi @ W_out  # (13,)
-
-    # Fusion coefficient (Eq. 5)
-    w_fusion = np.clip(0.3 * np.mean(attention_ssi) + 0.7 * np.mean(attention_ssf), 0.1, 0.9)
-
-    # Preliminary fusion (Eq. 6)
-    F_prelim = w_fusion * F_ssf_projected + (1 - w_fusion) * F_ssi_projected
-    # print(f"F_prelim: {F_prelim.tolist()[:5]}...")
-
-    # Residual connection and L2 normalization (Eq. 7)
-    F_sef = np.concatenate([sef_weighted, np.zeros(3)])  # (13,)
-    F_cfef = np.concatenate([np.zeros(10), cfef_scaled])  # (13,)
-    unified_feature = F_prelim + 0.5 * w_fusion * F_sef + 0.5 * (1 - w_fusion) * F_cfef
-    # print(f"Unified feature before norm: {unified_feature.tolist()[:5]}...")
-    norm = np.linalg.norm(unified_feature) + 1e-8
-    # print(f"Norm: {norm}")
-    unified_feature = unified_feature / norm
-    # print(f"Unified feature after norm: {unified_feature.tolist()[:5]}...")
-
-    return unified_feature
-
+# ---------------------------------------------------------------------------
 # Example usage
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Download distilroberta-base to local cache (optional)
-    try:
-        os.makedirs("./hf_cache", exist_ok=True)
-        AutoTokenizer.from_pretrained("distilroberta-base", cache_dir="./hf_cache")
-        AutoModel.from_pretrained("distilroberta-base", cache_dir="./hf_cache", use_safetensors=True)
-    except Exception as e:
-        print(f"Error downloading distilroberta-base to ./hf_cache: {e}")
-        print("Using default cache (~/.cache/huggingface).")
-
     # Mock SEF data
     sef = [0.3745, 0.9507, 0.7320, 0.5987, 0.1560, 0.1560, 0.0581, 0.8662, 0.6011, 0.7081]
     unified_feature = symflow_feature_fusion(
         jumpSeq="PUSH1 0x80 PUSH1 0x40 JUMPI",
         pc=0x12,
+        constraint="msg.sender == owner",
         sef=sef,
         coverage_branch=sef[3],
         coverage_path=sef[4]
     )
     print(f"Unified Feature Vector: {unified_feature.tolist()}")
-    
+    print(f"Vector dimension: {len(unified_feature)}")
+    print(f"L2 norm: {np.linalg.norm(unified_feature):.4f}")

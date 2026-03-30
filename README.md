@@ -1,1 +1,30 @@
-Smart contracts are immutable blockchain programs where a single vulnerability can lead to significant financial losses. Symbolic execution is a cornerstone technique for detecting such flaws by systematically exploring execution paths. However, it faces the path explosion problem, where the exponential growth of symbolic states limits Control Flow Graph (CFG) coverage. This limitation results in overlooking critical paths with potential security flaws, reducing vulnerability detection accuracy. We present SE4SC-LLM, the first symbolic execution framework that augments machine learning with Large Language Model (LLM) embeddings to overcome these limitations. Unlike prior approaches that rely on hand-crafted numeric features, SE4SC-LLM introduces EVM-aware symbolic execution features (SEF) tailored to runtime stack and jump semantics, and LLM-encoded control flow embedding features (CFEF) that capture implicit branching patterns via textual bytecode sequences. These heterogeneous features are fused through a coverage-driven dynamic attention mechanism, enabling a regression model to iteratively learn high-reward state selection strategy. Evaluated on two public datasets, SE4SC-LLM achieves 92.4% average CFG coverage–a 7% improvement over the strongest baseline (LEARCH)–and detects 9.0% more vulnerabilities, particularly in reentrancy and unchecked calls. Our open-source prototype is available at https://github.com/mth0801/SE4SC-LLM. SE4SC-LLM demonstrates that LLM-augmented semantic reasoning can fundamentally enhance symbolic path exploration, offering a new foundation for secure smart contract analysis.
+# SE4SC-LLM
+
+**SE4SC-LLM: An LLM-augmented Symbolic Execution Framework for Smart Contracts**
+
+Smart contracts are immutable Blockchain programs, where a single vulnerability can lead to significant financial losses. Symbolic execution is a cornerstone technique for detecting such flaws by systematically exploring execution paths. However, it suffers from path explosion problem, where the exponential growth of candidate states limits Control Flow Graph (CFG) coverage. This limitation results in overlooking critical paths with potential security flaws, reducing vulnerability detection accuracy.
+
+To address this, we propose SE4SC-LLM, an LLM-augmented symbolic execution framework for smart contracts. It operates in a learning-inference paradigm, anchoring state selection on guidance from a Large Language Model (LLM). In SE4SC-LLM, LLM directly provides the dominant control-flow semantics by encoding bytecode sequences, introducing a feature modality beyond numeric runtime statistics. A coverage-driven attention mechanism fuses the semantic embeddings with numeric features, and a regression model trained on the fused representation iteratively learns a high-reward state selection strategy. This strategy guides symbolic execution toward more effective path exploration.
+
+Evaluated on two public datasets, SE4SC-LLM achieves 95.1% average CFG coverage, a 6.5 percentage point improvement over the strongest baseline, and detects 11.2% more vulnerabilities, particularly in reentrancy and unchecked calls.
+
+## Requirements
+
+- Python 3.8.9
+- Solcx 0.4.24
+- Pyevmasm 0.2.3
+- Transformers 4.52.4
+- Scikit-learn 1.0.2
+- PyTorch 2.5.1
+- SciPy 1.12.0
+
+## Usage
+
+```bash
+cd scripts
+python machine_learning_for_se.py
+```
+
+## License
+
+This project is open-sourced for academic research purposes.
