@@ -58,9 +58,10 @@ def copy_random_files(source_dir, dest_dir, num_files=20):
     logger.info(f"Successfully copied {num_files} files to '{dest_dir}'")
 
 if __name__ == "__main__":
-    # Example usage
-    source_directory = "/Users/miaohuidong/demos/RESC/test_smartcontract_dataset/smartbugs-wild/contracts"  # Replace with your source path
-    destination_directory = "/Users/miaohuidong/demos/RESC/test_smartcontract_dataset/dataset_for_train"  # Replace with your destination path
+    # Use relative paths from the script directory
+    script_dir = os.path.dirname(__file__)
+    source_directory = os.path.join(script_dir, "..", "test_smartcontract_dataset", "smartbugs-wild", "contracts")
+    destination_directory = os.path.join(script_dir, "..", "test_smartcontract_dataset", "dataset_for_train")
     
     try:
         copy_random_files(source_directory, destination_directory, num_files=50)
