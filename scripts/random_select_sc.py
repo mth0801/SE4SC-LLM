@@ -58,11 +58,11 @@ def copy_random_files(source_dir, dest_dir, num_files=20):
     logger.info(f"Successfully copied {num_files} files to '{dest_dir}'")
 
 if __name__ == "__main__":
-    # Use relative paths from the script directory
-    script_dir = os.path.dirname(__file__)
-    source_directory = os.path.join(script_dir, "..", "test_smartcontract_dataset", "smartbugs-wild", "contracts")
-    destination_directory = os.path.join(script_dir, "..", "test_smartcontract_dataset", "dataset_for_train")
-    
+    # Default: use paths relative to this script's location
+    base_dir = os.path.join(os.path.dirname(__file__), "..", "test_smartcontract_dataset")
+    source_directory = os.path.join(base_dir, "smartbugs-wild", "contracts")
+    destination_directory = os.path.join(base_dir, "dataset_for_train")
+
     try:
         copy_random_files(source_directory, destination_directory, num_files=50)
     except Exception as e:

@@ -34,11 +34,11 @@ def copy_random_contracts(source_dir, dest_dir, num_files=50):
         print(f"Copied {file_name} to {dest_dir}")
 
 if __name__ == "__main__":
-    # Use relative paths from the script directory
-    script_dir = os.path.dirname(__file__)
-    source_dir = os.path.join(script_dir, "..", "test_smartcontract_dataset", "smartbugs-wild", "contracts")
-    dest_dir = os.path.join(script_dir, "..", "test_smartcontract_dataset", "test_dataset_for_train")
-    
+    # Default: use paths relative to this script's location
+    base_dir = os.path.join(os.path.dirname(__file__), "..", "test_smartcontract_dataset")
+    source_dir = os.path.join(base_dir, "smartbugs-wild", "contracts")
+    dest_dir = os.path.join(base_dir, "test_dataset_for_train")
+
     try:
         copy_random_contracts(source_dir, dest_dir, num_files=1)
         print(f"Successfully copied .sol files to {dest_dir}")
